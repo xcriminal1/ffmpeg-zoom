@@ -6,15 +6,28 @@ const ffmpegPath = require("ffmpeg-static");
 const { spawn } = require("child_process");
 const FormData = require("form-data");
 const fetch = require("node-fetch");
+const cors = require("cors");
 
 const app = express();
+
+/* -------------------- MIDDLEWARE -------------------- */
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const PORT = 8080;
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-bot-secret"]
+}));
+
+// Explicit preflight support (IMPORTANT)
+app.options("*", cors());
+
+/* -------------------- CONFIG -------------------- */
+const PORT = 8080; // Railway-friendly, locked
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 
-// -------------------- SESSION STATE --------------------
+/* -------------------- SESSION STATE -------------------- */
 let state = {
   recording: false,
   meetingUrl: null,
@@ -24,34 +37,35 @@ let state = {
   chunksDir: null
 };
 
-// -------------------- HEALTH --------------------
+/* -------------------- HEALTH -------------------- */
 app.get("/", (req, res) => {
   res.send("Backend is running");
 });
 
-// -------------------- STATUS --------------------
+/* -------------------- STATUS -------------------- */
 app.get("/status", (req, res) => {
   res.json({
     recording: state.recording,
     meetingUrl: state.meetingUrl,
-    customerName: state.customerName,
-    port: PORT
+    customerName: state.customerName
   });
 });
 
-// -------------------- JOIN (NON-BLOCKING) --------------------
-app.get("/join", async (req, res) => {
+/* -------------------- JOIN (POST – NON BLOCKING) -------------------- */
+app.post("/join", async (req, res) => {
   if (state.recording) {
-    return res.status(409).send("Already recording");
+    return res.status(409).json({ error: "Already recording" });
   }
 
-  const { meetingUrl, passcode, customer_name } = req.query;
-  if (!meetingUrl) return res.status(400).send("meetingUrl required");
+  const { meetingUrl, passcode, customer_name } = req.body;
+  if (!meetingUrl) {
+    return res.status(400).json({ error: "meetingUrl required" });
+  }
 
-  // respond immediately (CRITICAL)
-  res.send("Join request accepted. Bot starting in background.");
+  // Respond immediately (CRITICAL)
+  res.json({ status: "accepted", message: "Bot starting in background" });
 
-  // background task
+  // Run bot in background
   startZoomBot(meetingUrl, passcode, customer_name)
     .catch(err => {
       console.error("Zoom bot failed:", err);
@@ -59,13 +73,13 @@ app.get("/join", async (req, res) => {
     });
 });
 
-// -------------------- STOP --------------------
+/* -------------------- STOP -------------------- */
 app.post("/stop", async (req, res) => {
   if (!state.recording) {
-    return res.status(400).send("No active recording");
+    return res.status(400).json({ error: "No active recording" });
   }
 
-  res.send("Stopping recording");
+  res.json({ status: "stopping" });
 
   try {
     await state.page.evaluate(() => {
@@ -81,7 +95,7 @@ app.post("/stop", async (req, res) => {
   }
 });
 
-// -------------------- CORE LOGIC --------------------
+/* -------------------- CORE LOGIC -------------------- */
 async function startZoomBot(meetingUrl, passcode, customerName) {
   state.recording = true;
   state.meetingUrl = meetingUrl;
@@ -110,11 +124,14 @@ async function startZoomBot(meetingUrl, passcode, customerName) {
     fs.writeFileSync(`${chunksDir}/${Date.now()}.webm`, buf);
   });
 
+  console.log("Opening meeting:", meetingUrl);
   await page.goto(meetingUrl, { waitUntil: "networkidle", timeout: 60000 });
 
   try {
-    await page.click("text=Join from your browser", { timeout: 6000 });
-  } catch {}
+    await page.click("text=Join from your browser", { timeout: 8000 });
+  } catch {
+    console.log("Join from browser button not found");
+  }
 
   if (passcode) {
     try {
@@ -147,9 +164,11 @@ async function startZoomBot(meetingUrl, passcode, customerName) {
     recorder.start(5000);
     window.__recorder = recorder;
   });
+
+  console.log("Recording started");
 }
 
-// -------------------- CONVERT & SEND --------------------
+/* -------------------- CONVERT & SEND -------------------- */
 async function convertAndSend() {
   const webm = `meeting-${Date.now()}.webm`;
   const mp3 = `meeting-${Date.now()}.mp3`;
@@ -180,10 +199,12 @@ async function convertAndSend() {
       body: form,
       headers: form.getHeaders()
     });
+
+    console.log("Audio sent to n8n");
   }
 }
 
-// -------------------- CLEANUP --------------------
+/* -------------------- CLEANUP -------------------- */
 async function cleanup() {
   try {
     if (state.browser) await state.browser.close();
@@ -197,9 +218,11 @@ async function cleanup() {
     page: null,
     chunksDir: null
   };
+
+  console.log("Cleaned up session");
 }
 
-// -------------------- START SERVER --------------------
+/* -------------------- START SERVER -------------------- */
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on ${PORT}`);
 });
