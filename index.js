@@ -41,8 +41,14 @@ app.get("/", (req, res) => {
   res.send("Jitsi bot backend is running");
 });
 
-/* -------------------- STATUS -------------------- */
+/* -------------------- STATUS (NO CACHE) -------------------- */
 app.get("/status", (req, res) => {
+  res.set({
+    "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0"
+  });
+
   res.json({
     recording: state.recording,
     meetingUrl: state.meetingUrl,
@@ -80,7 +86,7 @@ app.post("/stop", async (req, res) => {
   await autoStop("manual-stop");
 });
 
-/* -------------------- AUTO STOP HANDLER -------------------- */
+/* -------------------- AUTO STOP -------------------- */
 async function autoStop(reason) {
   if (!state.recording) return;
 
@@ -113,7 +119,9 @@ async function startJitsiBot(meetingUrl, customerName) {
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--autoplay-policy=no-user-gesture-required"
+      "--autoplay-policy=no-user-gesture-required",
+      "--use-fake-ui-for-media-stream",
+      "--use-fake-device-for-media-stream"
     ]
   });
 
@@ -135,26 +143,30 @@ async function startJitsiBot(meetingUrl, customerName) {
     await autoStop("meeting-ended");
   });
 
-  console.log("Joining Jitsi meeting:", meetingUrl);
+  console.log("Joining Jitsi:", meetingUrl);
   await page.goto(meetingUrl, { waitUntil: "networkidle", timeout: 60000 });
 
-  // Set display name
+  /* -------- PREJOIN FIX -------- */
   await page.waitForTimeout(3000);
+
   await page.evaluate(() => {
-    const input = document.querySelector('input[name="displayName"]');
-    if (input) {
-      input.value = "🤖 AI Recorder";
-      input.dispatchEvent(new Event("input", { bubbles: true }));
+    const nameInput = document.querySelector('input[name="displayName"]');
+    if (nameInput) {
+      nameInput.value = "🤖 AI Recorder";
+      nameInput.dispatchEvent(new Event("input", { bubbles: true }));
     }
+
+    const prejoinBtn =
+      document.querySelector('[data-testid="prejoin.joinMeeting"]') ||
+      document.querySelector('button[type="submit"]');
+
+    if (prejoinBtn) prejoinBtn.click();
   });
 
-  // Join meeting
-  await page.waitForTimeout(1000);
-  await page.click('button[type="submit"]');
+  console.log("Join clicked, waiting for media...");
+  await page.waitForTimeout(8000);
 
-  await page.waitForTimeout(5000);
-
-  // Inject recorder + auto-leave logic
+  /* -------- AUDIO + AUTO LEAVE -------- */
   await page.evaluate(() => {
     const ctx = new AudioContext();
     const dest = ctx.createMediaStreamDestination();
@@ -184,7 +196,6 @@ async function startJitsiBot(meetingUrl, customerName) {
     recorder.start(5000);
     window.__recorder = recorder;
 
-    // Watch DOM changes
     const observer = new MutationObserver(() => {
       connectAudio();
       const participants = document.querySelectorAll('[class*="participant"]');
@@ -193,12 +204,8 @@ async function startJitsiBot(meetingUrl, customerName) {
       }
     });
 
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true
-    });
+    observer.observe(document.body, { childList: true, subtree: true });
 
-    // Page unload = meeting ended
     window.addEventListener("beforeunload", () => {
       window.notifyMeetingEnded();
     });
