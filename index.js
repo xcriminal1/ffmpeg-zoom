@@ -20,11 +20,10 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "x-bot-secret"]
 }));
 
-// Explicit preflight support (IMPORTANT)
 app.options("*", cors());
 
 /* -------------------- CONFIG -------------------- */
-const PORT = 8080; // Railway-friendly, locked
+const PORT = 8080;
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 
 /* -------------------- SESSION STATE -------------------- */
@@ -39,7 +38,7 @@ let state = {
 
 /* -------------------- HEALTH -------------------- */
 app.get("/", (req, res) => {
-  res.send("Backend is running");
+  res.send("Jitsi bot backend is running");
 });
 
 /* -------------------- STATUS -------------------- */
@@ -57,46 +56,54 @@ app.post("/join", async (req, res) => {
     return res.status(409).json({ error: "Already recording" });
   }
 
-  const { meetingUrl, passcode, customer_name } = req.body;
+  const { meetingUrl, customer_name } = req.body;
   if (!meetingUrl) {
     return res.status(400).json({ error: "meetingUrl required" });
   }
 
-  // Respond immediately (CRITICAL)
-  res.json({ status: "accepted", message: "Bot starting in background" });
+  res.json({ status: "accepted", message: "Jitsi bot starting" });
 
-  // Run bot in background
-  startZoomBot(meetingUrl, passcode, customer_name)
+  startJitsiBot(meetingUrl, customer_name)
     .catch(err => {
-      console.error("Zoom bot failed:", err);
+      console.error("Jitsi bot failed:", err);
       cleanup();
     });
 });
 
-/* -------------------- STOP -------------------- */
+/* -------------------- STOP (MANUAL) -------------------- */
 app.post("/stop", async (req, res) => {
   if (!state.recording) {
     return res.status(400).json({ error: "No active recording" });
   }
 
   res.json({ status: "stopping" });
+  await autoStop("manual-stop");
+});
+
+/* -------------------- AUTO STOP HANDLER -------------------- */
+async function autoStop(reason) {
+  if (!state.recording) return;
+
+  console.log("Auto-stop triggered:", reason);
 
   try {
     await state.page.evaluate(() => {
-      if (window.__recorder) window.__recorder.stop();
+      if (window.__recorder && window.__recorder.state !== "inactive") {
+        window.__recorder.stop();
+      }
     });
 
     await new Promise(r => setTimeout(r, 3000));
     await convertAndSend();
   } catch (err) {
-    console.error("Stop error:", err);
+    console.error("Auto-stop error:", err);
   } finally {
     cleanup();
   }
-});
+}
 
-/* -------------------- CORE LOGIC -------------------- */
-async function startZoomBot(meetingUrl, passcode, customerName) {
+/* -------------------- CORE JITSI LOGIC -------------------- */
+async function startJitsiBot(meetingUrl, customerName) {
   state.recording = true;
   state.meetingUrl = meetingUrl;
   state.customerName = customerName || "Unknown";
@@ -106,8 +113,7 @@ async function startZoomBot(meetingUrl, passcode, customerName) {
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--use-fake-ui-for-media-stream",
-      "--use-fake-device-for-media-stream"
+      "--autoplay-policy=no-user-gesture-required"
     ]
   });
 
@@ -124,35 +130,49 @@ async function startZoomBot(meetingUrl, passcode, customerName) {
     fs.writeFileSync(`${chunksDir}/${Date.now()}.webm`, buf);
   });
 
-  console.log("Opening meeting:", meetingUrl);
+  await page.exposeFunction("notifyMeetingEnded", async () => {
+    console.log("Browser detected meeting end");
+    await autoStop("meeting-ended");
+  });
+
+  console.log("Joining Jitsi meeting:", meetingUrl);
   await page.goto(meetingUrl, { waitUntil: "networkidle", timeout: 60000 });
 
-  try {
-    await page.click("text=Join from your browser", { timeout: 8000 });
-  } catch {
-    console.log("Join from browser button not found");
-  }
+  // Set display name
+  await page.waitForTimeout(3000);
+  await page.evaluate(() => {
+    const input = document.querySelector('input[name="displayName"]');
+    if (input) {
+      input.value = "🤖 AI Recorder";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  });
 
-  if (passcode) {
-    try {
-      await page.fill("input[type=password]", passcode);
-      await page.keyboard.press("Enter");
-    } catch {}
-  }
+  // Join meeting
+  await page.waitForTimeout(1000);
+  await page.click('button[type="submit"]');
 
   await page.waitForTimeout(5000);
 
+  // Inject recorder + auto-leave logic
   await page.evaluate(() => {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = new AudioContext();
     const dest = ctx.createMediaStreamDestination();
 
-    document.querySelectorAll("audio,video").forEach(el => {
-      try {
-        const src = ctx.createMediaElementSource(el);
-        src.connect(dest);
-        src.connect(ctx.destination);
-      } catch {}
-    });
+    function connectAudio() {
+      document.querySelectorAll("audio").forEach(el => {
+        try {
+          if (!el.__connected) {
+            const src = ctx.createMediaElementSource(el);
+            src.connect(dest);
+            src.connect(ctx.destination);
+            el.__connected = true;
+          }
+        } catch {}
+      });
+    }
+
+    connectAudio();
 
     const recorder = new MediaRecorder(dest.stream);
     recorder.ondataavailable = async e => {
@@ -163,9 +183,28 @@ async function startZoomBot(meetingUrl, passcode, customerName) {
 
     recorder.start(5000);
     window.__recorder = recorder;
+
+    // Watch DOM changes
+    const observer = new MutationObserver(() => {
+      connectAudio();
+      const participants = document.querySelectorAll('[class*="participant"]');
+      if (participants.length <= 1) {
+        window.notifyMeetingEnded();
+      }
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+
+    // Page unload = meeting ended
+    window.addEventListener("beforeunload", () => {
+      window.notifyMeetingEnded();
+    });
   });
 
-  console.log("Recording started");
+  console.log("Jitsi recording started");
 }
 
 /* -------------------- CONVERT & SEND -------------------- */
@@ -219,10 +258,10 @@ async function cleanup() {
     chunksDir: null
   };
 
-  console.log("Cleaned up session");
+  console.log("Session cleaned up");
 }
 
 /* -------------------- START SERVER -------------------- */
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on ${PORT}`);
+  console.log(`Jitsi bot server listening on ${PORT}`);
 });
