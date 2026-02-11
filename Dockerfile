@@ -1,11 +1,10 @@
-FROM mcr.microsoft.com/playwright:v1.44.0-jammy
+FROM node:18-slim
 
 WORKDIR /app
-
-COPY package.json ./
+COPY package.json .
 RUN npm install
 
 COPY . .
-
 EXPOSE 3000
-CMD ["node", "index.js"]
+
+CMD ["npm", "start"]
